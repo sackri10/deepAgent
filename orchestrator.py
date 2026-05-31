@@ -20,9 +20,10 @@ Key deepagents concepts used here:
 
 from deepagents import create_deep_agent
 from langchain_core.messages import HumanMessage
-from langchain_anthropic import ChatAnthropic
+
 from domain_agents import build_orders_agent, build_sales_agent
-from llm import llm_aws,model,sub_agent_model
+from llm import model,sub_agent_model
+from llm import llm_aws
 
 # ─────────────────────────────────────────────────────────────
 # Orchestrator system prompt
@@ -33,7 +34,22 @@ ORCHESTRATOR_SYSTEM_PROMPT = """You are a Text-to-SQL Orchestrator Agent.
 Your job: translate natural-language business questions into structured answers
 by coordinating specialist sub-agents via the task() tool.
 
-You have TWO specialist deep agents available:
+## MANDATORY FIRST STEP — YOU MUST ALWAYS DO THIS BEFORE ANYTHING ELSE
+
+Before calling task() or doing ANY other work, you MUST call write_todos() to
+create a visible plan. No exceptions. Format:
+
+  write_todos(todos=[
+    {"task": "Analyse question: decide which domain(s) are needed", "done": false},
+    {"task": "Delegate to orders-agent: <specific sub-question>",   "done": false},
+    {"task": "Delegate to sales-agent: <specific sub-question>",    "done": false},
+    {"task": "Synthesise results into final answer",                "done": false},
+  ])
+
+Only include the domains actually needed. After write_todos(), proceed with
+the plan step by step, calling write_todos() again to mark items done as you go.
+
+## Available sub-agents
 
   orders-agent
     Domain: customer orders, order status, delivery, order totals, per-customer spend
@@ -43,27 +59,20 @@ You have TWO specialist deep agents available:
     Domain: product revenue, sales rep performance, regional quotas, product margins
     When to use: question mentions revenue, sales, products sold, reps, regions, targets
 
-Decision rules:
-  - If the question spans BOTH domains → call task() for EACH agent with a focused sub-question.
-  - If it's clearly one domain → call task() for that agent only.
-  - Always reformulate the sub-question to be specific to that domain's data.
+## Delegation rules
+  - Cross-domain question → call task() for EACH agent with a focused sub-question.
+  - Single domain → call task() for that agent only.
+  - Always reformulate sub-questions to be specific to that domain's data.
+  - Always delegate — do NOT attempt SQL yourself.
 
-Delegation format (call task() like this):
-  task(name="orders-agent", task="<focused orders question>")
-  task(name="sales-agent",  task="<focused sales question>")
-
-After you receive results from all sub-agents:
-  - Synthesise them into a single, coherent, well-structured answer.
-  - Use markdown: bold key numbers, bullet points for lists.
+## After receiving sub-agent results
+  - Mark delegation todos as done with write_todos().
+  - Synthesise into a single, coherent, well-structured markdown answer.
+  - Bold key numbers, use bullet points for lists.
   - Cross-reference data between domains where meaningful.
   - Do NOT expose raw SQL or JSON in the final answer.
   - Do NOT ask follow-up questions — give a complete answer.
-
-IMPORTANT:
-  - Always delegate — do NOT attempt SQL yourself.
-  - Be explicit in sub-questions: include time ranges, grouping criteria, and
-    any filtering the user implied.
-  - If a sub-agent returns an error, note it and synthesise from the rest.
+  - Mark the synthesis todo as done.
 """
 
 
@@ -71,7 +80,7 @@ IMPORTANT:
 # Build the orchestrator
 # ─────────────────────────────────────────────────────────────
 
-def build_orchestrator(model: str = "anthropic:claude-sonnet-4-6") -> object:
+def build_orchestrator(model1: str = "openai:gpt-4o") -> object:
     """
     Assembles the full multi-agent system:
       Text-to-SQL Orchestrator (deep agent)
@@ -81,18 +90,20 @@ def build_orchestrator(model: str = "anthropic:claude-sonnet-4-6") -> object:
     The orchestrator uses a stronger model (gpt-4o) for coordination;
     sub-agents use a cheaper model (gpt-4o-mini) for SQL execution.
     """ 
-   
-    orders_subagent = build_orders_agent(model=sub_agent_model)
-    sales_subagent  = build_sales_agent(model=sub_agent_model)
+
+    orders_subagent = build_orders_agent(sub_agent_model)
+    sales_subagent  = build_sales_agent(sub_agent_model)
 
     orchestrator = create_deep_agent(
-        model=llm_aws,
+        model=model,
         system_prompt=ORCHESTRATOR_SYSTEM_PROMPT,
         name="text-to-sql-orchestrator",
         subagents=[
             orders_subagent,
             sales_subagent,
-        ]
+        ],
+        # No SQL tools on the orchestrator — it only coordinates
+        tools=[],
     )
 
     return orchestrator
@@ -101,26 +112,7 @@ def build_orchestrator(model: str = "anthropic:claude-sonnet-4-6") -> object:
 # ─────────────────────────────────────────────────────────────
 # Public API
 # ─────────────────────────────────────────────────────────────
-def ask_streaming_tokens(question: str):
-    """
-    Token-by-token streaming. Shows raw LLM output as it generates.
-    """
-    orchestrator = build_orchestrator()
 
-    print(f"\nQ: {question}\n")
-
-    for chunk, metadata in orchestrator.stream(
-        {"messages": [HumanMessage(content=question)]},
-        stream_mode="messages",
-    ):
-        # metadata contains lc_agent_name to identify which agent is speaking
-        agent_name = metadata.get("metadata", {}).get("lc_agent_name", "unknown")
-        content = getattr(chunk, "content", "")
-
-        if content and not getattr(chunk, "tool_calls", None):
-            # Label changes only when agent changes
-            print(content, end="", flush=True)
-                
 def ask(question: str, model: str = "openai:gpt-4o") -> str:
     """
     Ask a natural-language question.
